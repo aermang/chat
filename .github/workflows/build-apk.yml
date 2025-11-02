@@ -1,0 +1,284 @@
+name: 🚀 构建Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+        - debug
+        - release
+        - both
+
+env:
+  NODE_VERSION: '22.14.0'
+  JAVA_VERSION: '17'
+  GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.configureondemand=true -Dorg.gradle.jvmargs=-Xmx4g'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+      
+    - name: 设置Node.js环境
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        
+    - name: 设置Java环境
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: ${{ env.JAVA_VERSION }}
+        
+    - name: 设置Android SDK
+      uses: android-actions/setup-android@v3
+      with:
+        api-level: 33
+        build-tools: 33.0.0
+        
+    - name: 缓存Gradle依赖
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+          android/.gradle
+        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-
+        
+    - name: 缓存node_modules
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+        
+    - name: 安装依赖
+      run: |
+        npm ci --prefer-offline --no-audit
+        
+    - name: 验证环境
+      run: |
+        echo "Node.js版本: $(node --version)"
+        echo "npm版本: $(npm --version)"
+        echo "Java版本: $(java -version)"
+        echo "当前目录: $(pwd)"
+        echo "项目文件:"
+        ls -la
+        
+    - name: 构建Web应用
+      run: |
+        echo "开始构建Web应用..."
+        npm run build
+        echo "Web应用构建完成"
+        ls -la dist/
+        
+    - name: 安装Capacitor CLI
+      run: |
+        npm install -g @capacitor/cli@latest
+        npx cap --version
+        
+    - name: 清理Android项目
+      run: |
+        echo "清理Android项目..."
+        rm -rf android/app/src/main/assets/public || true
+        rm -rf android/capacitor-cordova-android-plugins/src/main || true
+        
+    - name: 同步Android项目
+      run: |
+        echo "同步Android项目..."
+        npx cap sync android --verbose
+        echo "同步完成"
+        
+    - name: 验证Android项目结构
+      run: |
+        echo "验证Android项目结构..."
+        ls -la android/
+        ls -la android/app/src/main/assets/ || true
+        
+    - name: 构建Android APK (Debug)
+      if: github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == ''
+      run: |
+        echo "🔨 开始构建Debug APK..."
+        cd android
+        chmod +x ./gradlew
+        
+        # 清理项目
+        echo "🧹 清理项目..."
+        ./gradlew clean --no-daemon
+        
+        # 构建Debug APK
+        echo "📱 构建Debug APK..."
+        ./gradlew assembleDebug --no-daemon --stacktrace --info --warning-mode all
+        
+        # 验证APK文件
+        if [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
+          echo "✅ Debug APK构建成功"
+          ls -la app/build/outputs/apk/debug/
+        else
+          echo "❌ Debug APK构建失败"
+          exit 1
+        fi
+        
+    - name: 构建Android APK (Release)
+      if: (github.ref == 'refs/heads/main' && (github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '')) || github.event.inputs.build_type == 'release'
+      run: |
+        echo "🔨 开始构建Release APK..."
+        cd android
+        
+        # 构建Release APK
+        echo "📱 构建Release APK..."
+        ./gradlew assembleRelease --no-daemon --stacktrace --info --warning-mode all
+        
+        # 验证APK文件
+        if [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
+          echo "✅ Release APK构建成功"
+          ls -la app/build/outputs/apk/release/
+        else
+          echo "❌ Release APK构建失败"
+          exit 1
+        fi
+        
+    - name: 📊 APK信息统计
+      if: always()
+      run: |
+        echo "📊 APK构建统计信息:"
+        echo "================================"
+        
+        # Debug APK信息
+        if [ -f "android/app/build/outputs/apk/debug/app-debug.apk" ]; then
+          debug_size=$(stat -c%s "android/app/build/outputs/apk/debug/app-debug.apk")
+          debug_size_mb=$((debug_size / 1024 / 1024))
+          echo "🐛 Debug APK: ${debug_size_mb}MB (${debug_size} bytes)"
+        fi
+        
+        # Release APK信息
+        if [ -f "android/app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
+          release_size=$(stat -c%s "android/app/build/outputs/apk/release/app-release-unsigned.apk")
+          release_size_mb=$((release_size / 1024 / 1024))
+          echo "🚀 Release APK: ${release_size_mb}MB (${release_size} bytes)"
+        fi
+        
+        echo "================================"
+        
+    - name: 📦 上传Debug APK
+      if: success() && (github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '')
+      uses: actions/upload-artifact@v4
+      with:
+        name: 聊天应用-Debug-v${{ github.run_number }}
+        path: android/app/build/outputs/apk/debug/app-debug.apk
+        retention-days: 30
+        
+    - name: 📦 上传Release APK
+      if: success() && ((github.ref == 'refs/heads/main' && (github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '')) || github.event.inputs.build_type == 'release')
+      uses: actions/upload-artifact@v4
+      with:
+        name: 聊天应用-Release-v${{ github.run_number }}
+        path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+        retention-days: 90
+        
+    - name: 上传构建日志
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ github.run_number }}
+        path: |
+          android/build/reports/
+          android/app/build/reports/
+        retention-days: 7
+        
+    - name: 🎉 创建GitHub Release
+      if: github.ref == 'refs/heads/main' && success()
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ github.run_number }}
+        name: 🚀 聊天应用 v${{ github.run_number }}
+        body: |
+          ## 📱 聊天应用 APK 发布
+          
+          > 🎯 **一键下载即用的Android聊天应用**
+          
+          ### 🚀 版本信息
+          - **构建编号**: `${{ github.run_number }}`
+          - **提交哈希**: `${{ github.sha }}`
+          - **构建时间**: `${{ github.event.head_commit.timestamp }}`
+          - **构建分支**: `${{ github.ref_name }}`
+          
+          ### 📦 下载文件
+          | 文件名 | 类型 | 用途 | 推荐 |
+          |--------|------|------|------|
+          | `app-debug.apk` | 调试版 | 开发测试 | 🧪 测试用户 |
+          | `app-release-unsigned.apk` | 发布版 | 生产使用 | ⭐ 推荐下载 |
+          
+          ### 🔧 安装说明
+          1. **下载APK**: 点击下方文件链接下载
+          2. **启用安装**: Android设备 → 设置 → 安全 → 允许未知来源
+          3. **安装应用**: 点击下载的APK文件进行安装
+          4. **开始使用**: 打开应用，注册账号即可开始聊天
+          
+          ### ✨ 应用特性
+          - 💬 实时聊天消息
+          - 👥 好友管理系统
+          - 📱 移动端优化界面
+          - 🔒 安全的用户认证
+          - 📸 图片分享功能
+          - 🌐 跨平台同步
+          
+          ### 📝 本次更新
+          ```
+          ${{ github.event.head_commit.message }}
+          ```
+          
+          ### 🐛 问题反馈
+          如遇到问题，请在 [Issues](../../issues) 页面反馈
+          
+          ---
+          
+          **📲 立即下载体验最新版本！**
+        files: |
+          android/app/build/outputs/apk/debug/app-debug.apk
+          android/app/build/outputs/apk/release/app-release-unsigned.apk
+        draft: false
+        prerelease: false
+        make_latest: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: 📢 构建完成通知
+      if: always()
+      run: |
+        echo "========================================="
+        echo "🎉 GitHub Actions 构建流程完成！"
+        echo "========================================="
+        
+        if [ "${{ job.status }}" == "success" ]; then
+          echo "✅ 构建状态: 成功"
+          echo "📦 APK文件已生成并上传"
+          echo "🔗 下载地址: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "🎉 Release已创建: https://github.com/${{ github.repository }}/releases/latest"
+          fi
+        else
+          echo "❌ 构建状态: 失败"
+          echo "📋 请查看构建日志排查问题"
+        fi
+        
+        echo "========================================="
